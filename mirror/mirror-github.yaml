@@ -1,0 +1,30 @@
+# 1. Ensure the `runs-on` field is set to a valid runner label.
+# 2. Ensure SOURCE_HOST is set to the correct hostname of your Copia instance.
+# 3. Replace the TARGET_REPO value with your GitHub owner and repository name in the format <owner>/<repository>.
+# 4. Create a new secret in your Copia repository or organization settings with the name TARGET_GITHUB_TOKEN. The value of the secret should be an access token with appropriate permissions for the target repository.
+# 5. Ensure you have Git CLI installed on your runner in order to execute the git commands in the workflow.
+name: Mirror Copia Repository to GitHub Repository
+on: [push]
+jobs:
+  mirror:
+    runs-on: my-runner-label
+    steps:
+      - name: Mirror
+        shell: bash
+        env:
+          SOURCE_HOST: app.copia.io
+          TARGET_REPO: MyGitHubOrganization/MyGitHubRepository
+          TARGET_TOKEN: ${{ secrets.TARGET_GITHUB_TOKEN }}
+        run: |
+          # Exit immediately if a command exits with a non-zero status, and print each command before executing it.
+          set -ex
+          # Clone the Copia source repository as a mirror, which includes all refs and branches. The runner's token is included in the URL for authentication.
+          git clone --mirror "https://${{ github.token }}@${SOURCE_HOST}/${{ github.repository }}.git" source.git
+          cd source.git
+          # Fetch all Git LFS objects for the source repository.
+          git lfs fetch --all
+          # Add the target repository as a new remote named "target", using the TARGET_TOKEN for authentication.
+          git remote add target "https://${TARGET_TOKEN}@github.com/${TARGET_REPO}.git"
+          # Push all refs and branches to the target repository, and also push all Git LFS objects.
+          git push --mirror target || true
+          git lfs push --all target
