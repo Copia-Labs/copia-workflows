@@ -1,0 +1,15 @@
+# 1. Replace the workflow name below with your own.
+# 2. Select the trigger that starts your workflow under `on` (e.g. push, pull_request, workflow_dispatch, schedule).
+# 3. Ensure the `runs-on` field is set to a valid runner label. Your registered runners and their labels are listed under Settings > Actions > Runners.
+# 4. Add your job steps under `steps`.
+name: Your-Workflow-Name-Here
+on: [push]
+jobs:
+  my-first-job:
+    runs-on: self-hosted
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+      - name: Say hello
+        shell: bash
+        run: echo "Hello from Copia Actions!"
