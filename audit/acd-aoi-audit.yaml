@@ -30,12 +30,24 @@ jobs:
           - MyOrganization/my-first-repository
           - MyOrganization/my-second-repository
     steps:
+      # actions/checkout is deliberately not used here: with a token input it stores an
+      # extra Authorization header that conflicts with the LFS download authorization,
+      # so `lfs: true` fails against Copia with HTTP 400. A plain authenticated clone
+      # (the same approach as the Mirror workflow) downloads LFS content correctly.
       - name: Check out the repository
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ matrix.repo }}
-          token: ${{ secrets.AOI_AUDIT_TOKEN }}
-          lfs: true
+        shell: bash
+        env:
+          REPO: ${{ matrix.repo }}
+          TOKEN: ${{ secrets.AOI_AUDIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Runners in host mode reuse the same workspace for every matrix entry, so
+          # clear out anything a previous repository's audit left behind.
+          rm -rf audit-src aoi-audit-converted.L5X aoi-rows.csv
+          host="${GITHUB_SERVER_URL#*://}"
+          git clone --depth 1 "https://token:${TOKEN}@${host}/${REPO}.git" audit-src
+          cd audit-src
+          git lfs pull
 
       - name: Locate the ACD file
         id: locate
@@ -46,7 +58,7 @@ jobs:
           set -euo pipefail
           # Artifact names cannot contain slashes, so derive a safe per-repo name.
           echo "safe_repo=${REPO//\//__}" >> "$GITHUB_OUTPUT"
-          mapfile -t acd_files < <(find . -path ./.git -prune -o -type f -iname '*.acd' -print | sort)
+          mapfile -t acd_files < <(find audit-src -path audit-src/.git -prune -o -type f -iname '*.acd' -print | sort)
           if [ "${#acd_files[@]}" -eq 0 ]; then
             echo "No ACD file found in ${REPO} — skipping."
             echo "found=false" >> "$GITHUB_OUTPUT"
@@ -65,7 +77,7 @@ jobs:
         # A failed conversion is reported in the run summary instead of failing the
         # whole audit — a failed job here would skip the merge job entirely.
         continue-on-error: true
-        uses: Copia-Labs/convert-copia-file@v1.1.0
+        uses: Copia-Labs/convert-copia-file@v1.2.0
         with:
           file_path: ${{ steps.locate.outputs.acd_path }}
           conversion: rockwell-acd
