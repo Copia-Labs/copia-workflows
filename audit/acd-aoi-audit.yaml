@@ -1,0 +1,125 @@
+# Audits Rockwell Add-On Instructions across repositories: for every repository listed
+# below, this workflow finds the repository's ACD project file, converts it to L5X via
+# the Copia conversion service, extracts each AOI's name and revision, and publishes a
+# combined aoi-audit.csv artifact on the run page.
+#
+# 1. Ensure the `runs-on` fields are set to a valid runner label.
+# 2. List the repositories to audit under `jobs.audit.strategy.matrix.repo`. The list must be
+#    written out literally — expressions are not supported in matrix values.
+# 3. Create a secret named AOI_AUDIT_TOKEN in your Copia repository or organization settings.
+#    The value should be an access token with read access to every repository listed — the
+#    workflow's built-in token can only read the repository this workflow lives in.
+# 4. Ensure the runner has Git and Git LFS installed — ACD files are typically stored in Git LFS.
+# 5. Each repository is expected to contain a single ACD file. Repositories without one are
+#    reported and skipped; if several are found, the first (alphabetically) is audited.
+# 6. Run the workflow from the Actions tab, or uncomment the `schedule` block for a recurring
+#    audit. Download aoi-audit.csv from the run page's Artifacts section when it finishes.
+name: ACD-AOI-Audit
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 6 * * 1' # every Monday at 06:00 UTC
+
+jobs:
+  audit:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        repo:
+          - MyOrganization/my-first-repository
+          - MyOrganization/my-second-repository
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.AOI_AUDIT_TOKEN }}
+          lfs: true
+
+      - name: Locate the ACD file
+        id: locate
+        shell: bash
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          # Artifact names cannot contain slashes, so derive a safe per-repo name.
+          echo "safe_repo=${REPO//\//__}" >> "$GITHUB_OUTPUT"
+          mapfile -t acd_files < <(find . -path ./.git -prune -o -type f -iname '*.acd' -print | sort)
+          if [ "${#acd_files[@]}" -eq 0 ]; then
+            echo "No ACD file found in ${REPO} — skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${#acd_files[@]}" -gt 1 ]; then
+            echo "Multiple ACD files found in ${REPO} — auditing the first one:"
+            printf '  %s\n' "${acd_files[@]}"
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "acd_path=${acd_files[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Convert ACD to L5X
+        id: convert
+        if: steps.locate.outputs.found == 'true'
+        # A failed conversion is reported in the run summary instead of failing the
+        # whole audit — a failed job here would skip the merge job entirely.
+        continue-on-error: true
+        uses: Copia-Labs/convert-copia-file@v1.1.0
+        with:
+          file_path: ${{ steps.locate.outputs.acd_path }}
+          conversion: rockwell-acd
+          output_path: aoi-audit-converted.L5X
+
+      - name: Extract AOI names and revisions
+        shell: bash
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          : > aoi-rows.csv
+          if [ ! -f aoi-audit-converted.L5X ]; then
+            echo "No converted L5X for ${REPO} (no ACD file, or the conversion failed — see the job log)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          { tr -d '\r' < aoi-audit-converted.L5X | grep -o '<AddOnInstructionDefinition [^>]*' || true; } |
+            while IFS= read -r tag; do
+              name=$(sed -n 's/.* Name="\([^"]*\)".*/\1/p' <<< "$tag")
+              revision=$(sed -n 's/.* Revision="\([^"]*\)".*/\1/p' <<< "$tag")
+              printf '%s,%s\n' "$name" "$revision"
+            done > aoi-rows.csv
+          echo "Extracted $(wc -l < aoi-rows.csv) AOIs from ${REPO}."
+
+      - name: Upload this repository's rows
+        uses: actions/upload-artifact@v3
+        with:
+          name: aoi-rows-${{ steps.locate.outputs.safe_repo }}
+          path: aoi-rows.csv
+
+  merge:
+    needs: audit
+    runs-on: self-hosted
+    steps:
+      - name: Download all audit rows
+        uses: actions/download-artifact@v3
+        with:
+          path: audit-parts
+
+      - name: Combine into aoi-audit.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AOI Name,Version Num" > aoi-audit.csv
+          shopt -s nullglob
+          files=(audit-parts/aoi-rows-*/aoi-rows.csv)
+          if [ "${#files[@]}" -gt 0 ]; then
+            cat "${files[@]}" >> aoi-audit.csv
+          fi
+          total=$(( $(wc -l < aoi-audit.csv) - 1 ))
+          echo "ACD AOI Audit collected ${total} AOIs across ${#files[@]} repositories." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the combined CSV
+        uses: actions/upload-artifact@v3
+        with:
+          name: aoi-audit
+          path: aoi-audit.csv
