@@ -1,0 +1,106 @@
+# Monitors a controller tag in this repository's Rockwell ACD backup: on every new
+# backup commit it converts the latest ACD to L5X via the Copia conversion service,
+# extracts the tag's value, and emails it to the configured recipient.
+#
+# Install this workflow in the repository that receives the ACD backups (for example a
+# DeviceLink backup repository).
+#
+# 1. Ensure the `runs-on` field is set to a valid runner label.
+# 2. In the `env` section below, set TAG_NAME to the controller tag to monitor.
+#    Atomic tags (BOOL, SINT, INT, DINT, REAL) are supported.
+# 3. Configure the email settings in `env` (recipient, sender, SMTP server and port), and
+#    create MAIL_USERNAME / MAIL_PASSWORD secrets if your SMTP server requires authentication.
+# 4. Ensure the runner has Git and Git LFS installed — ACD files are typically stored in Git LFS.
+# 5. The workflow runs on every push, i.e. every new backup. It can also be run on demand
+#    from the Actions tab, or on a recurring schedule via a `schedule` block.
+name: ACD-Tag-Value-Monitor
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: self-hosted
+    env:
+      TAG_NAME: Your-Tag-Name-Here
+      TO_EMAIL: recipient@example.com
+      FROM_EMAIL: copia-tag-monitor@example.com
+      MAIL_SERVER: smtp.example.com
+      MAIL_PORT: "465"
+    steps:
+      # actions/checkout is deliberately not used here: its `lfs: true` mode fails against
+      # Copia (the LFS download ends up with two Authorization headers and is rejected),
+      # so clone the repository directly instead.
+      - name: Get the latest backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf backup-src tag-monitor-converted.L5X
+          host="${GITHUB_SERVER_URL#*://}"
+          # On Copia, GITHUB_REF_NAME can be the full ref (refs/heads/<branch>) rather
+          # than the short branch name — strip the prefix so both forms work.
+          branch="${GITHUB_REF_NAME#refs/heads/}"
+          git clone --depth 1 --branch "${branch}" "https://${{ github.token }}@${host}/${GITHUB_REPOSITORY}.git" backup-src
+          cd backup-src
+          git lfs pull
+
+      - name: Locate the ACD file
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t acd_files < <(find backup-src -path backup-src/.git -prune -o -type f -iname '*.acd' -print | sort)
+          if [ "${#acd_files[@]}" -eq 0 ]; then
+            echo "No ACD file found — install this workflow in the repository that receives the ACD backups." >&2
+            exit 1
+          fi
+          if [ "${#acd_files[@]}" -gt 1 ]; then
+            echo "Multiple ACD files found — monitoring the first one:"
+            printf '  %s\n' "${acd_files[@]}"
+          fi
+          echo "acd_path=${acd_files[0]}" >> "$GITHUB_OUTPUT"
+          echo "display_path=${acd_files[0]#backup-src/}" >> "$GITHUB_OUTPUT"
+
+      - name: Convert ACD to L5X
+        uses: Copia-Labs/convert-copia-file@v1.2.0
+        with:
+          file_path: ${{ steps.locate.outputs.acd_path }}
+          conversion: rockwell-acd
+          output_path: tag-monitor-converted.L5X
+
+      - name: Extract the tag value
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          value=$(awk -v tag="$TAG_NAME" '
+            $0 ~ ("<Tag Name=\"" tag "\"") { in_tag = 1 }
+            in_tag && /<DataValue / && match($0, /Value="[^"]*"/) {
+              print substr($0, RSTART + 7, RLENGTH - 8); exit
+            }
+            in_tag && /<\/Tag>/ { exit }
+          ' tag-monitor-converted.L5X)
+          if [ -z "$value" ]; then
+            echo "Tag \"${TAG_NAME}\" was not found in the converted project (or is not an atomic tag)." >&2
+            exit 1
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
+          echo "Tag \`${TAG_NAME}\` = **${value}** in the latest backup of ${GITHUB_REPOSITORY}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Email the tag value
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: ${{ env.MAIL_SERVER }}
+          server_port: ${{ env.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: Copia Tag Monitor <${{ env.FROM_EMAIL }}>
+          to: ${{ env.TO_EMAIL }}
+          subject: "${{ env.TAG_NAME }} = ${{ steps.extract.outputs.value }} in ${{ github.repository }}"
+          body: |
+            Tag ${{ env.TAG_NAME }} in the latest ACD backup of ${{ github.repository }}:
+
+            Value: ${{ steps.extract.outputs.value }}
+            File: ${{ steps.locate.outputs.display_path }}
+            Commit: ${{ github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
