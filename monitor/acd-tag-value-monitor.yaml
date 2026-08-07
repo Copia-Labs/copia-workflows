@@ -65,18 +65,36 @@ jobs:
 
       - name: Report the tag value
         shell: bash
+        env:
+          ACD_PATH: ${{ steps.locate.outputs.acd_path }}
         run: |
           set -euo pipefail
-          value=$(awk -v tag="$TAG_NAME" '
-            $0 ~ ("<Tag Name=\"" tag "\"") { in_tag = 1 }
+          result=$(awk -v tag="$TAG_NAME" '
+            $0 ~ ("<Tag Name=\"" tag "\"") {
+              in_tag = 1
+              if (match($0, /DataType="[^"]*"/)) dtype = substr($0, RSTART + 10, RLENGTH - 11)
+            }
             in_tag && /<DataValue / && match($0, /Value="[^"]*"/) {
-              print substr($0, RSTART + 7, RLENGTH - 8); exit
+              print substr($0, RSTART + 7, RLENGTH - 8) "|" dtype; exit
             }
             in_tag && /<\/Tag>/ { exit }
           ' tag-monitor-converted.L5X)
-          if [ -z "$value" ]; then
+          if [ -z "$result" ]; then
             echo "Tag \"${TAG_NAME}\" was not found in the converted project (or is not an atomic tag)." >&2
             exit 1
           fi
+          value="${result%%|*}"
+          data_type="${result#*|}"
           echo "${TAG_NAME}: ${value}"
-          echo "${TAG_NAME}: ${value}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Copia Tag Value Monitor"
+            echo
+            echo "### \`${TAG_NAME}\`: **${value}**"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Data type | ${data_type} |"
+            echo "| ACD file | \`${ACD_PATH#backup-src/}\` |"
+            echo "| Backup commit | \`${GITHUB_SHA:0:10}\` |"
+            echo "| Checked | $(date -u '+%Y-%m-%d %H:%M UTC') |"
+          } >> "$GITHUB_STEP_SUMMARY"
