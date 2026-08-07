@@ -1,0 +1,160 @@
+# Monitors a controller tag in this repository's Rockwell ACD backup: on every new
+# backup commit it converts the latest ACD to L5X via the Copia conversion service,
+# extracts the tag's value, and emails it to the configured recipient.
+#
+# Install this workflow in the repository that receives the ACD backups (for example a
+# DeviceLink backup repository).
+#
+# 1. Ensure the `runs-on` field is set to a valid runner label.
+# 2. In the `env` section below, set TAG_NAME to the controller tag to monitor.
+#    Atomic tags (BOOL, SINT, INT, DINT, REAL) are supported.
+# 3. Configure the email settings in `env` (recipient, sender, SMTP server and port), and
+#    create MAIL_USERNAME / MAIL_PASSWORD secrets if your SMTP server requires authentication.
+# 4. Ensure the runner has Git and Git LFS installed — ACD files are typically stored in Git LFS.
+# 5. The workflow runs on every push, i.e. every new backup. It can also be run on demand
+#    from the Actions tab, or on a recurring schedule via a `schedule` block.
+name: ACD-Tag-Value-Monitor
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: self-hosted
+    env:
+      TAG_NAME: Your-Tag-Name-Here
+      TO_EMAIL: recipient@example.com
+      FROM_EMAIL: copia-tag-monitor@example.com
+      MAIL_SERVER: smtp.example.com
+      MAIL_PORT: "465"
+    steps:
+      # actions/checkout is deliberately not used here: its `lfs: true` mode fails against
+      # Copia (the LFS download ends up with two Authorization headers and is rejected),
+      # so clone the repository directly instead.
+      - name: Get the latest backup
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf backup-src tag-monitor-converted.L5X
+          host="${GITHUB_SERVER_URL#*://}"
+          # On Copia, GITHUB_REF_NAME can be the full ref (refs/heads/<branch>) rather
+          # than the short branch name — strip the prefix so both forms work.
+          branch="${GITHUB_REF_NAME#refs/heads/}"
+          git clone --depth 1 --branch "${branch}" "https://${{ github.token }}@${host}/${GITHUB_REPOSITORY}.git" backup-src
+          cd backup-src
+          git lfs pull
+
+      - name: Locate the ACD file
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t acd_files < <(find backup-src -path backup-src/.git -prune -o -type f -iname '*.acd' -print | sort)
+          if [ "${#acd_files[@]}" -eq 0 ]; then
+            echo "No ACD file found — install this workflow in the repository that receives the ACD backups." >&2
+            exit 1
+          fi
+          if [ "${#acd_files[@]}" -gt 1 ]; then
+            echo "Multiple ACD files found — monitoring the first one:"
+            printf '  %s\n' "${acd_files[@]}"
+          fi
+          echo "acd_path=${acd_files[0]}" >> "$GITHUB_OUTPUT"
+          echo "display_path=${acd_files[0]#backup-src/}" >> "$GITHUB_OUTPUT"
+
+      - name: Convert ACD to L5X
+        uses: Copia-Labs/convert-copia-file@v1.2.0
+        with:
+          file_path: ${{ steps.locate.outputs.acd_path }}
+          conversion: rockwell-acd
+          output_path: tag-monitor-converted.L5X
+
+      - name: Extract the tag value
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          value=$(awk -v tag="$TAG_NAME" '
+            $0 ~ ("<Tag Name=\"" tag "\"") { in_tag = 1 }
+            in_tag && /<DataValue / && match($0, /Value="[^"]*"/) {
+              print substr($0, RSTART + 7, RLENGTH - 8); exit
+            }
+            in_tag && /<\/Tag>/ { exit }
+          ' tag-monitor-converted.L5X)
+          if [ -z "$value" ]; then
+            echo "Tag \"${TAG_NAME}\" was not found in the converted project (or is not an atomic tag)." >&2
+            exit 1
+          fi
+          echo "value=${value}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:10}" >> "$GITHUB_OUTPUT"
+          echo "checked_at=$(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+          echo "Tag \`${TAG_NAME}\` = **${value}** in the latest backup of ${GITHUB_REPOSITORY}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Email the tag value
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: ${{ env.MAIL_SERVER }}
+          server_port: ${{ env.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: Copia Tag Monitor <${{ env.FROM_EMAIL }}>
+          to: ${{ env.TO_EMAIL }}
+          subject: "Copia Tag Monitor: ${{ env.TAG_NAME }} = ${{ steps.extract.outputs.value }} (${{ github.repository }})"
+          body: |
+            Copia Tag Monitor — new backup checked
+
+            Tag:     ${{ env.TAG_NAME }}
+            Value:   ${{ steps.extract.outputs.value }}
+            Project: ${{ github.repository }}
+            File:    ${{ steps.locate.outputs.display_path }}
+            Commit:  ${{ steps.extract.outputs.short_sha }}
+            Checked: ${{ steps.extract.outputs.checked_at }}
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          html_body: |
+            <div style="margin:0;padding:32px 16px;background-color:#eff5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;">
+                <tr>
+                  <td style="padding:0 4px 14px 4px;">
+                    <span style="font-size:17px;font-weight:700;color:#002626;letter-spacing:0.2px;">Copia</span>
+                    <span style="font-size:13px;color:#3d8076;">&nbsp;&middot;&nbsp;Tag Value Monitor</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background:#ffffff;border:1px solid #dedede;border-radius:8px;padding:28px;">
+                    <p style="margin:0 0 4px 0;font-size:13px;color:#767676;">A new backup of
+                      <a href="${{ github.server_url }}/${{ github.repository }}" style="color:#3d8076;text-decoration:none;font-weight:600;">${{ github.repository }}</a>
+                      was checked</p>
+                    <p style="margin:0 0 22px 0;font-size:24px;font-weight:600;color:#002626;">
+                      ${{ env.TAG_NAME }}&nbsp;=&nbsp;<span style="color:#3d8076;">${{ steps.extract.outputs.value }}</span>
+                    </p>
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border-top:1px solid #ebebeb;">
+                      <tr>
+                        <td style="padding:10px 0;color:#767676;width:110px;">File</td>
+                        <td style="padding:10px 0;color:#002626;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;">${{ steps.locate.outputs.display_path }}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px 0;color:#767676;border-top:1px solid #ebebeb;">Commit</td>
+                        <td style="padding:10px 0;color:#002626;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;border-top:1px solid #ebebeb;">${{ steps.extract.outputs.short_sha }}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px 0;color:#767676;border-top:1px solid #ebebeb;">Checked</td>
+                        <td style="padding:10px 0;color:#002626;border-top:1px solid #ebebeb;">${{ steps.extract.outputs.checked_at }}</td>
+                      </tr>
+                    </table>
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:22px;">
+                      <tr>
+                        <td style="background:#3d8076;border-radius:6px;">
+                          <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}"
+                             style="display:inline-block;padding:11px 20px;font-size:14px;color:#ffffff;text-decoration:none;font-weight:600;">View workflow run</a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:14px 4px;font-size:12px;color:#767676;">
+                    Sent automatically by the ACD Tag Value Monitoring workflow in your Copia Actions library.
+                  </td>
+                </tr>
+              </table>
+            </div>
