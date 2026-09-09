@@ -6,10 +6,10 @@
 # 1. Ensure the `runs-on` field is set to a valid runner label.
 # 2. List the repositories to audit under `repos`, one per line. Blank lines and lines
 #    starting with # are ignored.
-# 3. Create a secret named AOI_AUDIT_TOKEN in your Copia repository or organization
-#    settings. The value should be an access token with read access to every repository
-#    listed — the workflow's built-in token can only read the repository this workflow
-#    lives in.
+# 3. `token` must have read access to every repository listed. COPIA_TOKEN is the
+#    standard provided token. If it cannot reach a repository you want to audit, store
+#    an access token that can in your Copia repository or organization settings and
+#    reference that secret instead.
 # 4. Ensure the runner has Git and Git LFS installed — ACD files are typically stored in
 #    Git LFS.
 # 5. Run the workflow from the Actions tab, or uncomment the `schedule` block for a
@@ -40,7 +40,7 @@ jobs:
           repos: |
             MyOrganization/my-first-repository
             MyOrganization/my-second-repository
-          token: ${{ secrets.AOI_AUDIT_TOKEN }}
+          token: ${{ secrets.COPIA_TOKEN }}
 
       - name: Upload the combined CSV
         uses: actions/upload-artifact@v3
